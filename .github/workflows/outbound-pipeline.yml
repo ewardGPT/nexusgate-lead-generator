@@ -1,0 +1,28 @@
+name: Outbound Lead Pipeline
+
+on:
+  schedule:
+    - cron: '0 13 * * 1-5'  # Runs every weekday at 9am ET (13:00 UTC)
+  workflow_dispatch:         # Also triggerable manually
+
+jobs:
+  trigger-n8n:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Trigger n8n outbound workflow
+        run: |
+          echo "Triggering NexusGate outbound lead pipeline..."
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${{ secrets.N8N_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d '{"trigger": "scheduled_outbound"}')
+
+          echo "Response status: $HTTP_STATUS"
+
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            echo "✅ Pipeline triggered successfully"
+          else
+            echo "❌ Failed to trigger pipeline (HTTP $HTTP_STATUS)"
+            exit 1
+          fi

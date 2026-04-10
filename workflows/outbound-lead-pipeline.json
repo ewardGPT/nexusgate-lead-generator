@@ -1,0 +1,903 @@
+{
+  "name": "NexusGate Outbound Lead Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule — Weekdays 9am ET",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 400],
+      "notes": "Triggers the outbound pipeline every weekday at 9am ET. Also manually triggerable via workflow_dispatch."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "batch-1",
+              "name": "batch_id",
+              "value": "={{ $today.format('yyyy-MM-dd') }}",
+              "type": "string"
+            },
+            {
+              "id": "max-per-day",
+              "name": "maxEmailsPerDay",
+              "value": "=50",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "init-batch-limits",
+      "name": "Initialize Batch Limits",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [460, 400],
+      "notes": "Sets daily batch ID and max emails per day (50) for sender reputation protection"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Generate Apify Google Maps scraping tasks for DMV service businesses\n// ============================================================\n\nconst businessTypes = [\n  'Roofing companies',\n  'HVAC contractors',\n  'Plumbers',\n  'General contractors',\n  'Remodelers',\n  'Dental clinics',\n  'Law firms',\n  'Real estate agencies',\n  'Insurance agencies',\n  'Landscaping companies',\n  'Auto repair shops',\n  'Med spas',\n  'Aesthetic clinics',\n  'Cleaning services'\n];\n\nconst dmvLocations = [\n  'Washington DC',\n  'Arlington VA',\n  'Alexandria VA',\n  'Fairfax VA',\n  'Bethesda MD',\n  'Rockville MD',\n  'Silver Spring MD',\n  'Gaithersburg MD',\n  'Silver Spring MD',\n  'Frederick MD',\n  'Germantown MD',\n  'Reston VA',\n  'Ashburn VA',\n  'Manassas VA',\n  'Annapolis MD',\n  'Bowie MD',\n  'College Park MD',\n  'Falls Church VA',\n  'McLean VA',\n  'Vienna VA'\n];\n\n// Generate search queries: each business type × each DMV location\nconst searchQueries = [];\nfor (const type of businessTypes) {\n  for (const location of dmvLocations) {\n    searchQueries.push(`${type} in ${location}`);\n  }\n}\n\n// Return as individual items for n8n split-batch processing\nreturn searchQueries.map(query => ({\n  json: {\n    searchQuery: query,\n    businessType: query.split(' in ')[0],\n    city: query.split(' in ')[1],\n    batch_id: $input.first().json.batch_id\n  }\n}));"
+      },
+      "id": "generate-search-queries",
+      "name": "Generate DMV Search Queries",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 400],
+      "notes": "Generates all business-type × DMV-location combinations for Google Maps scraping"
+    },
+    {
+      "parameters": {
+        "batchSize": 10,
+        "options": {}
+      },
+      "id": "split-batches",
+      "name": "Split Into Batches",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [900, 400],
+      "notes": "Processes search queries in batches of 10 to stay within Apify rate limits"
+    },
+    {
+      "parameters": {
+        "actor": "apify/google-maps-scraper",
+        "input": {
+          "searchStringsArray": ["={{ $json.searchQuery }}"],
+          "maxCrawledPlacesPerSearch": 30,
+          "includeWeb": true,
+          "includeEmails": true,
+          "includePhoneNumbers": true
+        },
+        "options": {
+          "waitForFinish": 300
+        }
+      },
+      "id": "apify-google-maps",
+      "name": "Apify — Google Maps Scraper",
+      "type": "n8n-nodes-base.apify",
+      "typeVersion": 2,
+      "position": [1120, 280],
+      "notes": "Primary source: scrapes Google Maps for DMV service businesses with name, phone, website, email, rating, reviews"
+    },
+    {
+      "parameters": {
+        "actor": "apify/yelp-scraper",
+        "input": {
+          "searchStringsArray": ["={{ $json.searchQuery }}"],
+          "maxResults": 30,
+          "includeReviews": false
+        },
+        "options": {
+          "waitForFinish": 300
+        }
+      },
+      "id": "apify-yelp",
+      "name": "Apify — Yelp Scraper",
+      "type": "n8n-nodes-base.apify",
+      "typeVersion": 2,
+      "position": [1120, 520],
+      "notes": "Secondary source: scrapes Yelp for businesses not on Google Maps"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Normalize and merge results from Google Maps + Yelp\n// Standardize schema, discard leads missing email\n// ============================================================\n\nconst items = $input.all();\nconst merged = [];\n\nfor (const item of items) {\n  const data = item.json;\n  \n  // Detect source\n  const source = data.source || (data.url?.includes('yelp') ? 'yelp' : 'google_maps');\n  \n  // Extract email — try multiple fields\n  const email = (\n    data.email ||\n    data.emails?.[0] ||\n    data.contactEmail ||\n    ''\n  ).trim().toLowerCase();\n  \n  // DISCARD if no email\n  if (!email || !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)) {\n    continue;\n  }\n  \n  // Extract business type from the search query context\n  const businessType = (item.json.businessType || data.category || 'unknown').toLowerCase();\n  const city = (item.json.city || data.city || 'DMV').trim();\n  \n  merged.push({\n    json: {\n      business_name: (data.name || data.businessName || data.title || '').trim(),\n      owner_name: data.ownerName || data.contactName || null,\n      email: email,\n      phone: (data.phone || data.phoneNumber || data.tel || '').trim(),\n      website: (data.web || data.website || data.url || '').trim(),\n      business_type: businessType,\n      city: city,\n      google_rating: parseFloat(data.rating || data.stars || 0),\n      review_count: parseInt(data.reviewCount || data.reviews || data.numberOfReviews || 0),\n      source: source,\n      address: (data.address || data.fullAddress || '').trim(),\n      _scraped_at: new Date().toISOString()\n    }\n  });\n}\n\nreturn merged;"
+      },
+      "id": "normalize-scraped-leads",
+      "name": "Normalize & Merge Leads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 400],
+      "notes": "Merges Google Maps + Yelp results, normalizes schema, discards leads without email"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Deduplicate leads by email address\n// Keep the record with the most data (most non-empty fields)\n// ============================================================\n\nconst items = $input.all();\nconst seen = new Map();\n\nfor (const item of items) {\n  const email = item.json.email;\n  if (!email) continue;\n  \n  const existing = seen.get(email);\n  if (!existing) {\n    seen.set(email, item);\n    continue;\n  }\n  \n  // Count non-empty fields for each\n  const countFields = (obj) => Object.values(obj).filter(v => v && v !== '' && v !== null).length;\n  const existingScore = countFields(existing.json);\n  const newScore = countFields(item.json);\n  \n  // Keep the richer record\n  if (newScore > existingScore) {\n    seen.set(email, item);\n  }\n}\n\nreturn Array.from(seen.values());"
+      },
+      "id": "deduplicate-leads",
+      "name": "Deduplicate by Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 400],
+      "notes": "Removes duplicate leads by email, keeping the record with the most data"
+    },
+    {
+      "parameters": {
+        "actor": "apify/website-contact-scraper",
+        "input": {
+          "startUrls": "={{ $json.website ? [{ url: $json.website }] : [] }}",
+          "maxPages": 5,
+          "extractEmails": true,
+          "extractPhoneNumbers": true,
+          "extractContactForms": true
+        },
+        "options": {
+          "waitForFinish": 120
+        }
+      },
+      "id": "apify-website-scraper",
+      "name": "Apify — Website Contact Scraper",
+      "type": "n8n-nodes-base.apify",
+      "typeVersion": 2,
+      "position": [1780, 400],
+      "notes": "Scrapes each business website to extract contact emails, owner names, and contact form details"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Enrich leads with website contact data\n// ============================================================\n\nconst websiteData = $input.first().json;\nconst leadData = $('Deduplicate by Email').first().json;\n\n// Extract owner name from website content if not already known\nlet ownerName = leadData.owner_name;\nif (!ownerName && websiteData) {\n  // Try common patterns: \"Owner: John Smith\", \"Founded by\", etc.\n  const pageText = (websiteData.text || websiteData.content || '');\n  const ownerMatch = pageText.match(/(?:owner|founder|president|ceo)\\s*[:;]\\s*([A-Z][a-z]+\\s+[A-Z][a-z]+)/i);\n  if (ownerMatch) {\n    ownerName = ownerMatch[1].trim();\n  }\n}\n\n// Enrich email from website if we found a better one\nlet email = leadData.email;\nif (websiteData.emails && websiteData.emails.length > 0) {\n  // Prefer generic@domain or info@domain over personal emails\n  const genericEmail = websiteData.emails.find(e => \n    /^(info|contact|hello|office|front)/i.test(e.split('@')[0])\n  );\n  if (genericEmail) {\n    email = genericEmail.toLowerCase();\n  }\n}\n\nreturn [{\n  json: {\n    ...leadData,\n    owner_name: ownerName,\n    email: email,\n    website_contact_emails: websiteData.emails || [],\n    website_contact_phones: websiteData.phoneNumbers || [],\n    _enriched_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "enrich-website-data",
+      "name": "Enrich Website Contact Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 400],
+      "notes": "Merges website contact data into lead record, extracts owner name from page content"
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "prompt": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a sales qualification expert for NexusGate — an AI receptionist service that recovers missed calls and books appointments for local service businesses."
+            },
+            {
+              "role": "user",
+              "content": "=NexusGate's best customers are:\n- Phone-dependent businesses (roofing, HVAC, plumbing, dental, law, real estate)\n- Owner-operated or small team businesses (1–30 staff)\n- Businesses with real job values ($300–$5,000+ per job or client)\n- Businesses with no after-hours coverage or an overwhelmed front desk\n- Located in DC, Maryland, or Virginia\n\nScore this lead from 0–10 based on ICP fit:\n\nBusiness name: {{ $json.business_name }}\nBusiness type: {{ $json.business_type }}\nCity: {{ $json.city }}\nGoogle rating: {{ $json.google_rating }}\nReview count: {{ $json.review_count }}\nWebsite: {{ $json.website }}\n\nReturn ONLY valid JSON:\n{\n  \"score\": <integer 0-10>,\n  \"reasoning\": \"<1-2 sentences>\",\n  \"pain_point\": \"<the most likely pain this business has with missed calls>\",\n  \"personalization_hook\": \"<one specific detail to open the cold email with>\"\n}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.3,
+          "maxTokens": 400
+        }
+      },
+      "id": "openclaw-score-outbound",
+      "name": "OpenClaw — Score Outbound Lead",
+      "type": "n8n-nodes-base.openai",
+      "typeVersion": 1.5,
+      "position": [2220, 400],
+      "notes": "AI scores each lead on ICP fit for NexusGate's AI receptionist service"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Parse OpenClaw scoring response\n// ============================================================\n\nconst raw = $input.first().json.response || $input.first().json.content || '';\nconst cleaned = raw.replace(/```json\\s*/g, '').replace(/```/g, '').trim();\n\ntry {\n  const parsed = JSON.parse(cleaned);\n  const leadData = $('Enrich Website Contact Data').first().json;\n  \n  if (typeof parsed.score !== 'number' || parsed.score < 0 || parsed.score > 10) {\n    throw new Error(`Invalid score: ${parsed.score}`);\n  }\n  \n  return [{\n    json: {\n      ...leadData,\n      score: parsed.score,\n      reasoning: parsed.reasoning || '',\n      pain_point: parsed.pain_point || '',\n      personalization_hook: parsed.personalization_hook || ''\n    }\n  }];\n} catch (e) {\n  throw new Error(`Failed to parse scoring response: ${e.message}`);\n}"
+      },
+      "id": "parse-outbound-score",
+      "name": "Parse Score JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2440, 400],
+      "notes": "Parses LLM scoring response, validates score range, merges with lead data"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "type": "number" },
+                "conditions": [
+                  {
+                    "id": "high-score",
+                    "operator": { "type": "number", "operation": "gte" },
+                    "value": "7"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "high-score"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "type": "number" },
+                "conditions": [
+                  {
+                    "id": "low-score",
+                    "operator": { "type": "number", "operation": "lt" },
+                    "value": "7"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "low-score"
+            }
+          ]
+        }
+      },
+      "id": "switch-score-route",
+      "name": "Switch — Score Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.1,
+      "position": [2660, 400],
+      "notes": "Score ≥7 → cold email pipeline. Score <7 → log to disqualified_leads and stop."
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "outbound_leads",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "business_name",
+              "value": "={{ $json.business_name }}"
+            },
+            {
+              "name": "owner_name",
+              "value": "={{ $json.owner_name }}"
+            },
+            {
+              "name": "email",
+              "value": "={{ $json.email }}"
+            },
+            {
+              "name": "phone",
+              "value": "={{ $json.phone }}"
+            },
+            {
+              "name": "website",
+              "value": "={{ $json.website }}"
+            },
+            {
+              "name": "business_type",
+              "value": "={{ $json.business_type }}"
+            },
+            {
+              "name": "city",
+              "value": "={{ $json.city }}"
+            },
+            {
+              "name": "google_rating",
+              "value": "={{ $json.google_rating }}"
+            },
+            {
+              "name": "review_count",
+              "value": "={{ $json.review_count }}"
+            },
+            {
+              "name": "source",
+              "value": "={{ $json.source }}"
+            },
+            {
+              "name": "score",
+              "value": "={{ $json.score }}"
+            },
+            {
+              "name": "reasoning",
+              "value": "={{ $json.reasoning }}"
+            },
+            {
+              "name": "pain_point",
+              "value": "={{ $json.pain_point }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "supabase-insert-qualified",
+      "name": "Supabase — Insert Qualified Lead",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [2900, 280],
+      "notes": "Inserts qualified lead (score ≥7) into outbound_leads table"
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "disqualified_leads",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "email",
+              "value": "={{ $json.email }}"
+            },
+            {
+              "name": "business_name",
+              "value": "={{ $json.business_name }}"
+            },
+            {
+              "name": "business_type",
+              "value": "={{ $json.business_type }}"
+            },
+            {
+              "name": "score",
+              "value": "={{ $json.score }}"
+            },
+            {
+              "name": "reasoning",
+              "value": "={{ $json.reasoning }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "supabase-insert-disqualified",
+      "name": "Supabase — Log Disqualified Lead",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [2900, 520],
+      "notes": "Logs leads with score <7 to disqualified_leads table for future review"
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "prompt": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are Ervin, founder of NexusGate. You write like a real person — direct, warm, no marketing speak."
+            },
+            {
+              "role": "user",
+              "content": "=Write a cold outreach email for a local service business owner on behalf of NexusGate.\n\nNexusGate is an AI receptionist that answers missed calls, books appointments, and follows up with leads 24/7 — with no new staff and no new software for the team.\n\nLead details:\n- Business name: {{ $json.business_name }}\n- Business type: {{ $json.business_type }}\n- Owner name: {{ $json.owner_name }}\n- City: {{ $json.city }}\n- Personalization hook: {{ $json.personalization_hook }}\n- Their specific pain point: {{ $json.pain_point }}\n\nEmail rules:\n- Subject line: make it feel like a local, personal message — not a marketing blast\n- Under 120 words total\n- Open with the personalization hook — reference something real about their business\n- Mention the free 60-second audit as the CTA (not a sales call)\n- Link to: https://nexusgate.tech/#lead-capture\n- Sign off as Ervin, Founder of NexusGate\n- No buzzwords, no \"I hope this finds you well\", no bullet points\n- Sound like a real person, not a SaaS company\n\nReturn only the subject line and email body. No preamble.\nFormat:\nSubject: <subject line>\n\n<body>"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.7,
+          "maxTokens": 350
+        }
+      },
+      "id": "openclaw-generate-email",
+      "name": "OpenClaw — Generate Cold Email",
+      "type": "n8n-nodes-base.openai",
+      "typeVersion": 1.5,
+      "position": [3120, 280],
+      "notes": "Generates personalized cold email for each qualified lead"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Parse email from OpenClaw output — extract subject and body\n// ============================================================\n\nconst raw = $input.first().json.response || $input.first().json.content || '';\n\n// Split on \"Subject:\" or \"Subject :\" pattern\nconst subjectMatch = raw.match(/Subject:\\s*(.+?)(?:\\n|$)/i);\nconst subject = subjectMatch ? subjectMatch[1].trim() : `Quick question about ${$('Parse Score JSON').first().json.business_name}`;\n\n// Body is everything after the subject line\nlet body = raw;\nif (subjectMatch) {\n  body = raw.split(/Subject:\\s*.+?\\n/i).slice(1).join('\\n').trim();\n}\n\n// Clean up any markdown code blocks\nbody = body.replace(/^```/gm, '').trim();\n\nconst leadData = $('Parse Score JSON').first().json;\n\nreturn [{\n  json: {\n    ...leadData,\n    email_subject: subject,\n    email_body: body\n  }\n}];"
+      },
+      "id": "parse-email-content",
+      "name": "Parse Email Content",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3340, 280],
+      "notes": "Extracts subject line and body from OpenClaw email output"
+    },
+    {
+      "parameters": {
+        "fromEmail": "ervin@nexusgate.tech",
+        "toEmail": "={{ $json.email }}",
+        "subject": "={{ $json.email_subject }}",
+        "emailType": "text",
+        "message": "={{ $json.email_body }}",
+        "options": {}
+      },
+      "id": "gmail-send-email",
+      "name": "Gmail — Send Cold Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [3560, 280],
+      "notes": "Sends the personalized cold email from ervin@nexusgate.tech via Gmail"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "outbound_leads",
+        "sendBody": true,
+        "filters": {
+          "filters": [
+            {
+              "key": "email",
+              "value": "={{ $json.email }}"
+            }
+          ]
+        },
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "email_sent",
+              "value": "true"
+            },
+            {
+              "name": "email_sent_at",
+              "value": "={{ $now.format('yyyy-MM-dd HH:mm:ss') }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "supabase-update-email-sent",
+      "name": "Supabase — Mark Email Sent",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [3780, 280],
+      "notes": "Updates outbound_leads record: email_sent=true, email_sent_at=now()"
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "tableId": "outbound_leads",
+        "sendBody": true,
+        "filters": {
+          "filters": [
+            {
+              "key": "email",
+              "value": "={{ $json.email }}"
+            }
+          ]
+        },
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "audit_completed",
+              "value": "true"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "supabase-update-audit-done",
+      "name": "Supabase — Mark Audit Complete",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [3780, 480],
+      "notes": "Webhook trigger from nexusgate.tech when lead completes free audit"
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "tableId": "outbound_leads",
+        "sendBody": true,
+        "filters": {
+          "filters": [
+            {
+              "key": "email",
+              "value": "={{ $json.email }}"
+            }
+          ]
+        },
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "call_booked",
+              "value": "true"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "supabase-update-call-booked",
+      "name": "Supabase — Mark Call Booked",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [3780, 680],
+      "notes": "Webhook trigger from Calendly or booking flow when lead books a call"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_AUDIT_WEBHOOK_URL || '' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "email",
+              "value": "={{ $json.email }}"
+            },
+            {
+              "name": "audit_results",
+              "value": "={{ JSON.stringify($json.audit_results || {}) }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "webhook-audit-complete",
+      "name": "Webhook — Audit Complete Handler",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [3560, 480],
+      "webhookId": "nexusgate-audit-complete",
+      "notes": "Receives POST from nexusgate.tech when a lead completes the free audit"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_CALL_BOOKED_WEBHOOK_URL || '' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "email",
+              "value": "={{ $json.email }}"
+            },
+            {
+              "name": "booking_source",
+              "value": "={{ $json.booking_source || 'calendly' }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "webhook-call-booked",
+      "name": "Webhook — Call Booked Handler",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [3560, 680],
+      "webhookId": "nexusgate-call-booked",
+      "notes": "Receives POST from Calendly or booking flow when a lead books a strategy call"
+    },
+    {
+      "parameters": {
+        "text": "=🔔 NEW CALL BOOKED\n\n━━━━━━━━━━━━━━━━━━━━\n👤 Business: {{ $json.business_name }}\n📧 Email: {{ $json.email }}\n🏙️ City: {{ $json.city }}\n⭐ Score: {{ $json.score }}/10\n━━━━━━━━━━━━━━━━━━━━\n\nErvin — time to close! 🎯",
+        "otherOptions": {
+          "username": "NexusGate Pipeline Bot"
+        }
+      },
+      "id": "slack-call-booked-alert",
+      "name": "Slack — Call Booked Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [4000, 680],
+      "notes": "Alerts Ervin in Slack when a lead books a strategy call"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "{ \"status\": \"ok\" }",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "respond-webhook-audit",
+      "name": "Respond — Audit Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [4000, 480],
+      "notes": "Returns 200 OK to the audit completion webhook"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "{ \"status\": \"ok\" }",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "respond-webhook-booking",
+      "name": "Respond — Booking Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [4000, 880],
+      "notes": "Returns 200 OK to the call booked webhook"
+    }
+  ],
+  "connections": {
+    "Schedule — Weekdays 9am ET": {
+      "main": [
+        [
+          {
+            "node": "Initialize Batch Limits",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Initialize Batch Limits": {
+      "main": [
+        [
+          {
+            "node": "Generate DMV Search Queries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate DMV Search Queries": {
+      "main": [
+        [
+          {
+            "node": "Split Into Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Into Batches": {
+      "main": [
+        [
+          {
+            "node": "Apify — Google Maps Scraper",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Apify — Yelp Scraper",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apify — Google Maps Scraper": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Merge Leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apify — Yelp Scraper": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Merge Leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Merge Leads": {
+      "main": [
+        [
+          {
+            "node": "Deduplicate by Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deduplicate by Email": {
+      "main": [
+        [
+          {
+            "node": "Apify — Website Contact Scraper",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apify — Website Contact Scraper": {
+      "main": [
+        [
+          {
+            "node": "Enrich Website Contact Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enrich Website Contact Data": {
+      "main": [
+        [
+          {
+            "node": "OpenClaw — Score Outbound Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenClaw — Score Outbound Lead": {
+      "main": [
+        [
+          {
+            "node": "Parse Score JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Score JSON": {
+      "main": [
+        [
+          {
+            "node": "Switch — Score Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch — Score Router": {
+      "main": [
+        [
+          {
+            "node": "Supabase — Insert Qualified Lead",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Supabase — Log Disqualified Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase — Insert Qualified Lead": {
+      "main": [
+        [
+          {
+            "node": "OpenClaw — Generate Cold Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenClaw — Generate Cold Email": {
+      "main": [
+        [
+          {
+            "node": "Parse Email Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Email Content": {
+      "main": [
+        [
+          {
+            "node": "Gmail — Send Cold Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail — Send Cold Email": {
+      "main": [
+        [
+          {
+            "node": "Supabase — Mark Email Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook — Audit Complete Handler": {
+      "main": [
+        [
+          {
+            "node": "Supabase — Mark Audit Complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase — Mark Audit Complete": {
+      "main": [
+        [
+          {
+            "node": "Respond — Audit Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook — Call Booked Handler": {
+      "main": [
+        [
+          {
+            "node": "Supabase — Mark Call Booked",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase — Mark Call Booked": {
+      "main": [
+        [
+          {
+            "node": "Slack — Call Booked Alert",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Respond — Booking Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "executionTimeout": 1800,
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "createdAt": "2025-04-10T00:00:00.000Z",
+      "updatedAt": "2025-04-10T00:00:00.000Z",
+      "id": "3",
+      "name": "outbound"
+    },
+    {
+      "createdAt": "2025-04-10T00:00:00.000Z",
+      "updatedAt": "2025-04-10T00:00:00.000Z",
+      "id": "4",
+      "name": "lead-generation"
+    },
+    {
+      "createdAt": "2025-04-10T00:00:00.000Z",
+      "updatedAt": "2025-04-10T00:00:00.000Z",
+      "id": "5",
+      "name": "nexusgate"
+    }
+  ],
+  "triggerCount": 1,
+  "updatedAt": "2025-04-10T00:00:00.000Z",
+  "versionId": "2.0.0"
+}
