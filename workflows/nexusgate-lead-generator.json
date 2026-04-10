@@ -1,0 +1,765 @@
+{
+  "name": "NexusGate Lead Generator",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "incoming-lead",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {
+          "rateLimit": {
+            "enabled": true,
+            "windowMs": 60000,
+            "maxRequests": 10
+          }
+        }
+      },
+      "id": "webhook-trigger",
+      "name": "Incoming Lead",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 400],
+      "webhookId": "nexusgate-lead-webhook",
+      "notes": "Receives POST requests from the website lead capture form. Protected by secret header token and rate limiting."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Input Validation & Sanitization\n// ============================================================\nconst raw = $input.first().json.body || $input.first().json;\n\n// Honeypot check (spam bot detection)\nif (raw.website || raw.phone || raw._honeypot) {\n  throw new Error('Spam detected: honeypot field filled');\n}\n\n// Validate email is present and well-formed\nconst email = (raw.email || '').trim().toLowerCase();\nconst emailRegex = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\nif (!email || !emailRegex.test(email)) {\n  throw new Error('Invalid or missing email field');\n}\n\n// Sanitize strings: strip HTML/script tags\nfunction sanitize(str) {\n  if (typeof str !== 'string') return '';\n  return str\n    .replace(/<[^>]*>/g, '')\n    .replace(/javascript:/gi, '')\n    .replace(/on\\w+=/gi, '')\n    .trim()\n    .slice(0, 500); // Max 500 chars\n}\n\nconst name = sanitize(raw.name);\nconst company = sanitize(raw.company);\nconst useCase = sanitize(raw.use_case || raw.useCase).slice(0, 500);\n\n// Derive company domain from email if not provided\nconst companyDomain = sanitize(raw.company_domain || raw.companyDomain || email.split('@')[1] || '');\n\nreturn [{\n  json: {\n    email,\n    name,\n    company,\n    company_domain: companyDomain,\n    use_case: useCase,\n    _timestamp: new Date().toISOString(),\n    _lead_id: `lead_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`\n  }\n}];"
+      },
+      "id": "validate-input",
+      "name": "Validate & Sanitize Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 400],
+      "notes": "Rejects invalid emails, strips HTML/script tags, checks honeypot field for spam detection"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// A/B Testing: Randomly assign scoring prompt variant\n// ============================================================\nconst variant = Math.random() < 0.5 ? 'A' : 'B';\n\nreturn [{\n  json: {\n    ...$input.first().json,\n    _ab_test_variant: variant\n  }\n}];"
+      },
+      "id": "ab-test-assign",
+      "name": "A/B Test Assignment",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 400],
+      "notes": "Randomly assigns variant A or B for scoring prompt A/B testing"
+    },
+    {
+      "parameters": {
+        "fields": {
+          "values": [
+            {
+              "name": "email",
+              "stringValue": "={{ $json.email }}"
+            },
+            {
+              "name": "name",
+              "stringValue": "={{ $json.name }}"
+            },
+            {
+              "name": "company",
+              "stringValue": "={{ $json.company }}"
+            },
+            {
+              "name": "company_domain",
+              "stringValue": "={{ $json.company_domain }}"
+            },
+            {
+              "name": "use_case",
+              "stringValue": "={{ $json.use_case }}"
+            },
+            {
+              "name": "_timestamp",
+              "stringValue": "={{ $json._timestamp }}"
+            },
+            {
+              "name": "_lead_id",
+              "stringValue": "={{ $json._lead_id }}"
+            },
+            {
+              "name": "_ab_test_variant",
+              "stringValue": "={{ $json._ab_test_variant }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "normalize-data",
+      "name": "Normalize & Structure Data",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.3,
+      "position": [900, 400],
+      "notes": "Normalizes and structures incoming data into a consistent schema"
+    },
+    {
+      "parameters": {
+        "actor": "apify/website-content-crawler",
+        "input": {
+          "startUrls": [{ "url": "={{ 'https://' + $json.company_domain }}" }],
+          "maxCrawlDepth": 2,
+          "maxCrawlPages": 10,
+          "includeUrlGlobs": [".*about.*", ".*product.*", ".*pricing.*", ".*blog.*", ".*careers.*", ".*team.*"],
+          "maxPageDepth": 3000
+        },
+        "options": {
+          "waitForFinish": 120
+        }
+      },
+      "id": "apify-enrich",
+      "name": "Apify — Website Content Crawler",
+      "type": "n8n-nodes-base.apify",
+      "typeVersion": 2,
+      "position": [1120, 400],
+      "notes": "Crawls company website to extract tech stack, company size, and growth signals. Targets /about, /product, /pricing, /blog, /careers pages."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Merge crawled pages into enriched_context\n// ============================================================\nconst items = $input.all();\n\nlet allText = '';\nconst detectedTechs = new Set();\nlet metaDescription = '';\n\nfor (const item of items) {\n  const data = item.json;\n  \n  // Extract page text (first 3000 chars per page)\n  const pageText = (data.text || data.page_text || data.content || '').slice(0, 3000);\n  allText += pageText + '\\n\\n';\n  \n  // Collect meta descriptions\n  if (data.meta_description) {\n    metaDescription = data.meta_description;\n  }\n  \n  // Collect detected technologies\n  if (data.detected_technologies && Array.isArray(data.detected_technologies)) {\n    data.detected_technologies.forEach(t => detectedTechs.add(t));\n  }\n}\n\n// Cap enriched_context at 6000 characters\nconst enrichedContext = allText.trim().slice(0, 6000);\n\nconst leadData = $input.first().json;\n\nreturn [{\n  json: {\n    ...leadData,\n    enriched_context: enrichedContext,\n    meta_description: metaDescription,\n    detected_technologies: Array.from(detectedTechs),\n    _pages_crawled: items.length\n  }\n}];"
+      },
+      "id": "merge-crawl-data",
+      "name": "Merge & Enrich Crawl Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 400],
+      "notes": "Merges all crawled page text into enriched_context (max 6000 chars), extracts meta descriptions and detected technologies"
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "prompt": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a B2B sales qualification expert for NexusGate — an open-source AI Agent & LLM monitoring platform built for engineering teams deploying LLMs in production."
+            },
+            {
+              "role": "user",
+              "content": "=IDEAL CUSTOMER PROFILE (ICP):\n- AI/ML engineers or teams actively deploying or experimenting with LLMs\n- DevOps or platform engineers building LLM-powered pipelines\n- Companies with 10–500 employees in tech, fintech, healthtech, or SaaS\n- Teams using OpenAI, Anthropic, Mistral, or open-source models (Llama, Mistral, etc.)\n- Use cases: LLM observability, cost tracking, prompt management, agent monitoring\n\nNON-ICP (score low):\n- Non-technical roles (e.g., marketing, sales) with no developer context\n- Consumer apps with no LLM infrastructure\n- Companies with no signal of AI/ML activity\n\nINPUT:\n- Company website content: {{ $json.enriched_context }}\n- Self-reported use case: {{ $json.use_case }}\n- Detected technologies: {{ $json.detected_technologies.join(', ') }}\n\nTASK:\nScore this lead from 0 to 10 based on ICP fit. Return ONLY valid JSON in this format:\n{\n  \"score\": <integer 0–10>,\n  \"reasoning\": \"<2–3 sentence explanation referencing specific signals from the content>\",\n  \"icp_signals\": [\"<signal 1>\", \"<signal 2>\"],\n  \"disqualifiers\": [\"<any red flags>\"]\n}\n\nDo not include any text outside the JSON object."
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.3,
+          "maxTokens": 500
+        }
+      },
+      "id": "openclaw-scoring-a",
+      "name": "OpenClaw — Score Lead (Variant A)",
+      "type": "n8n-nodes-base.openai",
+      "typeVersion": 1.5,
+      "position": [1560, 280],
+      "notes": "Scoring Prompt Variant A — uses standard ICP rubric"
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "prompt": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a senior B2B sales engineer specializing in AI/ML infrastructure. You work for NexusGate, an open-source LLM observability platform."
+            },
+            {
+              "role": "user",
+              "content": "=You are evaluating a lead for NexusGate — open-source LLM monitoring and agent management.\n\nSCORING RUBRIC (0-10):\n\n**9-10 (Perfect ICP):** Actively deploying LLMs in production, mentions observability/monitoring/cost tracking, 10-500 employees, tech/fintech/healthtech/SaaS company.\n\n**7-8 (Strong ICP):** Building with AI/ML, using major model providers (OpenAI, Anthropic, open-source), engineering team context, growing company.\n\n**5-6 (Moderate ICP):** Some AI activity, unclear production usage, mixed technical signals.\n\n**3-4 (Weak ICP):** Early experimentation, non-production, small team, unclear fit.\n\n**0-2 (Non-ICP):** No AI/ML signals, non-technical company, consumer-focused, wrong company size.\n\nINPUT:\n- Company website content: {{ $json.enriched_context }}\n- Self-reported use case: {{ $json.use_case }}\n- Detected technologies: {{ $json.detected_technologies.join(', ') }}\n\nReturn ONLY valid JSON:\n{\n  \"score\": <integer 0-10>,\n  \"reasoning\": \"<2-3 sentences with specific signals>\",\n  \"icp_signals\": [\"list positive signals\"],\n  \"disqualifiers\": [\"list negative signals\"]\n}\n\nNo text outside the JSON object."
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.3,
+          "maxTokens": 500
+        }
+      },
+      "id": "openclaw-scoring-b",
+      "name": "OpenClaw — Score Lead (Variant B)",
+      "type": "n8n-nodes-base.openai",
+      "typeVersion": 1.5,
+      "position": [1560, 520],
+      "notes": "Scoring Prompt Variant B — uses detailed rubric-based scoring"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Parse LLM JSON response — strips markdown code blocks\n// ============================================================\nconst raw = $input.first().json.response || $input.first().json.content || $input.first().json.message;\n\nif (!raw) {\n  throw new Error('No response from OpenClaw scoring node');\n}\n\n// Strip markdown code blocks\nconst cleaned = raw\n  .replace(/```json\\s*/g, '')\n  .replace(/```/g, '')\n  .trim();\n\ntry {\n  const parsed = JSON.parse(cleaned);\n  \n  // Validate required fields\n  if (typeof parsed.score !== 'number' || parsed.score < 0 || parsed.score > 10) {\n    throw new Error(`Invalid score: ${parsed.score}. Must be integer 0-10.`);\n  }\n  \n  const leadData = $input.first().json;\n  \n  return [{\n    json: {\n      ...leadData,\n      score: parsed.score,\n      reasoning: parsed.reasoning || '',\n      icp_signals: parsed.icp_signals || [],\n      disqualifiers: parsed.disqualifiers || []\n    }\n  }];\n} catch (e) {\n  throw new Error(`Failed to parse LLM response as JSON: ${e.message}\\nRaw: ${cleaned}`);\n}"
+      },
+      "id": "parse-score",
+      "name": "Parse Score JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 400],
+      "notes": "Safely parses the LLM JSON response, strips markdown code blocks, validates score range"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "type": "number"
+                },
+                "conditions": [
+                  {
+                    "id": "high-intent",
+                    "operator": {
+                      "type": "number",
+                      "operation": "gt"
+                    },
+                    "value": "7"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "high-intent"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "type": "number"
+                },
+                "conditions": [
+                  {
+                    "id": "medium-intent",
+                    "operator": {
+                      "type": "number",
+                      "operation": "gte"
+                    },
+                    "value": "3"
+                  },
+                  {
+                    "id": "medium-intent-max",
+                    "operator": {
+                      "type": "number",
+                      "operation": "lte"
+                    },
+                    "value": "7"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "medium-intent"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "type": "number"
+                },
+                "conditions": [
+                  {
+                    "id": "low-intent",
+                    "operator": {
+                      "type": "number",
+                      "operation": "lt"
+                    },
+                    "value": "3"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "low-intent"
+            }
+          ]
+        }
+      },
+      "id": "switch-router",
+      "name": "Switch — Lead Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [2000, 400],
+      "notes": "Routes leads: High (>7) → immediate outreach, Medium (3-7) → nurture, Low (<3) → log only"
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "prompt": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a sales development representative for NexusGate, an open-source LLM monitoring platform."
+            },
+            {
+              "role": "user",
+              "content": "=Write a short, personalized outreach message (email or Slack) for the following lead:\n- Name: {{ $json.name }}\n- Company: {{ $json.company }}\n- Their stated use case: {{ $json.use_case }}\n- Why they scored high: {{ $json.reasoning }}\n\nGuidelines:\n- Keep it under 120 words\n- Lead with a specific insight from their use case or company context\n- Mention NexusGate's one-line integration and open-source nature\n- End with a low-friction CTA (e.g., \"Would a 15-min call make sense?\")\n- Do NOT use generic phrases like \"I hope this finds you well\"\n\nReturn only the message body. No subject line, no preamble."
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.7,
+          "maxTokens": 300
+        }
+      },
+      "id": "openclaw-outreach",
+      "name": "OpenClaw — Generate Outreach Message",
+      "type": "n8n-nodes-base.openai",
+      "typeVersion": 1.5,
+      "position": [2240, 200],
+      "notes": "Generates personalized outreach message for high-intent leads"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Extract outreach message from OpenClaw response\n// ============================================================\nconst raw = $input.first().json.response || $input.first().json.content || $input.first().json.message;\nconst outreachMessage = typeof raw === 'string' ? raw.replace(/^```/gm, '').trim() : JSON.stringify(raw);\n\nreturn [{\n  json: {\n    ...$input.first().json,\n    outreach_message: outreachMessage\n  }\n}];"
+      },
+      "id": "format-outreach",
+      "name": "Format Outreach Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2460, 200],
+      "notes": "Extracts and formats the outreach message for downstream nodes"
+    },
+    {
+      "parameters": {
+        "text": "=🔥 HIGH-INTENT LEAD ALERT\n\n━━━━━━━━━━━━━━━━━━━━\n👤 Name: {{ $json.name }}\n🏢 Company: {{ $json.company }}\n📧 Email: {{ $json.email }}\n⭐ Score: {{ $json.score }}/10\n━━━━━━━━━━━━━━━━━━━━\n\n📋 ICP Reasoning:\n{{ $json.reasoning }}\n\n🎯 Signals: {{ $json.icp_signals.join(', ') }}\n\n━━━━━━━━━━━━━━━━━━━━\n📝 AI-Generated Outreach Draft:\n\n{{ $json.outreach_message }}\n━━━━━━━━━━━━━━━━━━━━\n\n⚡ Ready to send — review and act!",
+        "otherOptions": {
+          "username": "NexusGate Lead Bot"
+        }
+      },
+      "id": "slack-high-intent",
+      "name": "Slack — High Intent Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [2680, 200],
+      "notes": "Sends real-time Slack alert to sales team with lead details and outreach draft"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.mailchimp.com/3.0/lists/{{ $env.NURTURE_LIST_ID }}/members",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "email_address",
+              "value": "={{ $json.email }}"
+            },
+            {
+              "name": "status",
+              "value": "subscribed"
+            },
+            {
+              "name": "merge_fields",
+              "value": "={\n  \"FNAME\": \"{{ $json.name }}\",\n  \"COMPANY\": \"{{ $json.company }}\",\n  \"USECASE\": \"{{ $json.use_case }}\",\n  \"SCORE\": \"{{ $json.score }}\",\n  \"REASON\": \"{{ $json.reasoning }}\"\n}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "mailchimp-nurture",
+      "name": "Mailchimp — Add to Nurture List",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2240, 400],
+      "notes": "Adds medium-intent leads to email nurture sequence via Mailchimp API"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.GOOGLE_SHEETS_API_URL || 'https://sheets.googleapis.com/v4/spreadsheets/' + $env.GOOGLE_SHEETS_SPREADSHEET_ID + '/values/Leads:append' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "googleOAuth2Api",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "range",
+              "value": "Leads!A:I"
+            },
+            {
+              "name": "valueInputOption",
+              "value": "USER_ENTERED"
+            },
+            {
+              "name": "values",
+              "value": "=[[{{ $json._timestamp }}, {{ $json.email }}, {{ $json.name }}, {{ $json.company }}, {{ $json.company_domain }}, {{ $json.score }}, {{ $json.reasoning }}, {{ $json._ab_test_variant }}, low-intent-logged]]"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "gsheet-low-intent",
+      "name": "Google Sheets — Log Low Intent Lead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2240, 600],
+      "notes": "Logs low-intent leads to Google Sheet for future analysis with score and reasoning"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.GOOGLE_SHEETS_API_URL || 'https://sheets.googleapis.com/v4/spreadsheets/' + $env.GOOGLE_SHEETS_SPREADSHEET_ID + '/values/Leads:append' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "googleOAuth2Api",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "range",
+              "value": "Leads!A:I"
+            },
+            {
+              "name": "valueInputOption",
+              "value": "USER_ENTERED"
+            },
+            {
+              "name": "values",
+              "value": "=[[{{ $json._timestamp }}, {{ $json.email }}, {{ $json.name }}, {{ $json.company }}, {{ $json.company_domain }}, {{ $json.score }}, {{ $json.reasoning }}, {{ $json._ab_test_variant }}, medium-nurture]]"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "gsheet-medium-intent",
+      "name": "Google Sheets — Log Medium Intent Lead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2460, 400],
+      "notes": "Logs medium-intent leads to Google Sheet for nurture tracking"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.GOOGLE_SHEETS_API_URL || 'https://sheets.googleapis.com/v4/spreadsheets/' + $env.GOOGLE_SHEETS_SPREADSHEET_ID + '/values/Leads:append' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "googleOAuth2Api",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "range",
+              "value": "Leads!A:I"
+            },
+            {
+              "name": "valueInputOption",
+              "value": "USER_ENTERED"
+            },
+            {
+              "name": "values",
+              "value": "=[[{{ $json._timestamp }}, {{ $json.email }}, {{ $json.name }}, {{ $json.company }}, {{ $json.company_domain }}, {{ $json.score }}, {{ $json.reasoning }}, {{ $json._ab_test_variant }}, high-outreach-sent]]"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "gsheet-high-intent",
+      "name": "Google Sheets — Log High Intent Lead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2900, 200],
+      "notes": "Logs high-intent leads to Google Sheet after Slack alert is sent"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.GOOGLE_SHEETS_API_URL || 'https://sheets.googleapis.com/v4/spreadsheets/' + $env.GOOGLE_SHEETS_SPREADSHEET_ID + '/values/Errors:append' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "googleOAuth2Api",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "range",
+              "value": "Errors!A:D"
+            },
+            {
+              "name": "valueInputOption",
+              "value": "USER_ENTERED"
+            },
+            {
+              "name": "values",
+              "value": "=[[{{ $now.format('yyyy-MM-dd HH:mm:ss') }}, {{ $workflow.name }}, {{ $json.node }}, {{ $json.message }}]]"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "gsheet-error-log",
+      "name": "Google Sheets — Log Error",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2680, 800],
+      "notes": "Logs workflow errors to Google Sheets for monitoring"
+    },
+    {
+      "parameters": {
+        "text": "=⚠️ NEXUSGATE WORKFLOW ERROR\n\n━━━━━━━━━━━━━━━━━━━━\n🔧 Workflow: {{ $workflow.name }}\n📍 Node: {{ $json.node }}\n━━━━━━━━━━━━━━━━━━━━\n\n📋 Error: {{ $json.message }}\n\n⏰ Time: {{ $now.format('yyyy-MM-dd HH:mm:ss') }}",
+        "otherOptions": {
+          "username": "NexusGate Error Bot"
+        }
+      },
+      "id": "slack-error-alert",
+      "name": "Slack — Error Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [2900, 800],
+      "notes": "Sends error alerts to admin Slack channel for immediate attention"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "{ \"status\": \"received\", \"lead_id\": \"{{ $json._lead_id }}\" }",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "response-node",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [3120, 200],
+      "notes": "Returns success response to the form submission"
+    }
+  ],
+  "connections": {
+    "Incoming Lead": {
+      "main": [
+        [
+          {
+            "node": "Validate & Sanitize Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Sanitize Input": {
+      "main": [
+        [
+          {
+            "node": "A/B Test Assignment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A/B Test Assignment": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Structure Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Structure Data": {
+      "main": [
+        [
+          {
+            "node": "Apify — Website Content Crawler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apify — Website Content Crawler": {
+      "main": [
+        [
+          {
+            "node": "Merge & Enrich Crawl Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge & Enrich Crawl Data": {
+      "main": [
+        [
+          {
+            "node": "OpenClaw — Score Lead (Variant A)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "OpenClaw — Score Lead (Variant B)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenClaw — Score Lead (Variant A)": {
+      "main": [
+        [
+          {
+            "node": "Parse Score JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenClaw — Score Lead (Variant B)": {
+      "main": [
+        [
+          {
+            "node": "Parse Score JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Score JSON": {
+      "main": [
+        [
+          {
+            "node": "Switch — Lead Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch — Lead Router": {
+      "main": [
+        [
+          {
+            "node": "OpenClaw — Generate Outreach Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mailchimp — Add to Nurture List",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Google Sheets — Log Low Intent Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenClaw — Generate Outreach Message": {
+      "main": [
+        [
+          {
+            "node": "Format Outreach Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Outreach Message": {
+      "main": [
+        [
+          {
+            "node": "Slack — High Intent Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack — High Intent Alert": {
+      "main": [
+        [
+          {
+            "node": "Google Sheets — Log High Intent Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mailchimp — Add to Nurture List": {
+      "main": [
+        [
+          {
+            "node": "Google Sheets — Log Medium Intent Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Sheets — Log Low Intent Lead": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Sheets — Log Medium Intent Lead": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Sheets — Log High Intent Lead": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "executionTimeout": 300
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "createdAt": "2025-04-10T00:00:00.000Z",
+      "updatedAt": "2025-04-10T00:00:00.000Z",
+      "id": "1",
+      "name": "lead-generation"
+    },
+    {
+      "createdAt": "2025-04-10T00:00:00.000Z",
+      "updatedAt": "2025-04-10T00:00:00.000Z",
+      "id": "2",
+      "name": "nexusgate"
+    }
+  ],
+  "triggerCount": 1,
+  "updatedAt": "2025-04-10T00:00:00.000Z",
+  "versionId": "1.0.0"
+}

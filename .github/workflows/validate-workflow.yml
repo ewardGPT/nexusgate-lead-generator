@@ -1,0 +1,146 @@
+name: Validate n8n Workflow JSON
+
+on:
+  push:
+    paths:
+      - 'workflows/**.json'
+  pull_request:
+    paths:
+      - 'workflows/**.json'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate JSON syntax
+        run: |
+          echo "=== Validating JSON syntax ==="
+          for file in workflows/*.json; do
+            echo -n "Validating $file... "
+            if python3 -c "import json; json.load(open('$file'))"; then
+              echo "✅ Valid JSON"
+            else
+              echo "❌ Invalid JSON: $file"
+              exit 1
+            fi
+          done
+
+      - name: Check required n8n nodes
+        run: |
+          echo "=== Checking required n8n nodes ==="
+          python3 -c "
+          import json
+          import sys
+
+          workflow_file = 'workflows/nexusgate-lead-generator.json'
+
+          with open(workflow_file) as f:
+              wf = json.load(f)
+
+          nodes = wf.get('nodes', [])
+          node_types = [n.get('type', '') for n in nodes]
+          node_names = [n.get('name', '') for n in nodes]
+
+          print(f'Found {len(nodes)} nodes:')
+          for name in node_names:
+              print(f'  - {name}')
+
+          # Required node types for the lead generator workflow
+          required_types = [
+              'n8n-nodes-base.webhook',
+              'n8n-nodes-base.set',
+              'n8n-nodes-base.switch',
+              'n8n-nodes-base.code',
+          ]
+
+          missing = []
+          for r in required_types:
+              if not any(r in nt for nt in node_types):
+                  missing.append(r)
+
+          if missing:
+              print(f'\\n❌ Missing required node types: {missing}')
+              sys.exit(1)
+
+          print('\\n✅ All required node types present')
+          "
+
+      - name: Validate workflow connections
+        run: |
+          echo "=== Validating workflow connections ==="
+          python3 -c "
+          import json
+          import sys
+
+          with open('workflows/nexusgate-lead-generator.json') as f:
+              wf = json.load(f)
+
+          connections = wf.get('connections', {})
+          nodes = wf.get('nodes', [])
+          node_ids = {n['id'] for n in nodes}
+          node_names = {n['name'] for n in nodes}
+
+          # Check that all connection targets reference valid nodes
+          errors = []
+          for source_node, source_connections in connections.items():
+              if source_node not in node_names:
+                  errors.append(f'Source node \"{source_node}\" not found in nodes list')
+
+              for output_index, outputs in source_connections.items():
+                  for output in outputs:
+                      target_name = output.get('node', '')
+                      if target_name and target_name not in node_names:
+                          errors.append(f'Target node \"{target_name}\" not found (from {source_node})')
+
+          if errors:
+              print('Connection errors found:')
+              for err in errors:
+                  print(f'  ❌ {err}')
+              sys.exit(1)
+
+          print('✅ All connections reference valid nodes')
+          "
+
+      - name: Validate workflow settings
+        run: |
+          echo "=== Validating workflow settings ==="
+          python3 -c "
+          import json
+          import sys
+
+          with open('workflows/nexusgate-lead-generator.json') as f:
+              wf = json.load(f)
+
+          settings = wf.get('settings', {})
+
+          # Check execution timeout is set
+          timeout = settings.get('executionTimeout')
+          if timeout:
+              print(f'✅ Execution timeout set: {timeout}s')
+          else:
+              print('⚠️ No execution timeout set (recommended: 300s)')
+
+          # Check saveManualExecutions
+          if settings.get('saveManualExecutions'):
+              print('✅ Manual execution saving enabled')
+
+          # Check that workflow has a name
+          name = wf.get('name', '')
+          if name:
+              print(f'✅ Workflow name: {name}')
+          else:
+              print('❌ Workflow has no name')
+              sys.exit(1)
+
+          print('\\n✅ Workflow settings validation passed')
+          "

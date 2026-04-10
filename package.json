@@ -1,0 +1,33 @@
+{
+  "name": "nexusgate-lead-generator",
+  "version": "1.0.0",
+  "description": "Production-grade, high-conversion lead generation system for NexusGate — an open-source AI Agent & LLM application monitoring platform",
+  "main": "index.js",
+  "scripts": {
+    "test": "npx playwright test",
+    "test:ui": "npx playwright test --ui",
+    "test:headed": "npx playwright test --headed",
+    "test:report": "npx playwright show-report",
+    "validate:workflow": "node scripts/validate-workflow.js",
+    "lint": "eslint . --ext .js,.jsx"
+  },
+  "keywords": [
+    "lead-generation",
+    "n8n",
+    "nexusgate",
+    "llm",
+    "ai-monitoring",
+    "apify",
+    "openclaw",
+    "playwright"
+  ],
+  "author": "NexusGate Team",
+  "license": "MIT",
+  "devDependencies": {
+    "@playwright/test": "^1.44.0",
+    "eslint": "^8.57.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
