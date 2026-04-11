@@ -393,19 +393,19 @@
     },
     {
       "parameters": {
-        "fromEmail": "ervin@nexusgate.tech",
         "toEmail": "={{ $json.email }}",
         "subject": "={{ $json.email_subject }}",
         "emailType": "text",
         "message": "={{ $json.email_body }}",
+        "fromEmail": "ervin@nexusgate.tech",
         "options": {}
       },
-      "id": "gmail-send-email",
-      "name": "Gmail — Send Cold Email",
-      "type": "n8n-nodes-base.gmail",
-      "typeVersion": 2.1,
+      "id": "smtp-send-email",
+      "name": "SMTP — Send Cold Email",
+      "type": "n8n-nodes-base.smtp",
+      "typeVersion": 1,
       "position": [3560, 280],
-      "notes": "Sends the personalized cold email from ervin@nexusgate.tech via Gmail"
+      "notes": "Sends the personalized cold email from ervin@nexusgate.tech via SMTP"
     },
     {
       "parameters": {
@@ -800,14 +800,14 @@
       "main": [
         [
           {
-            "node": "Gmail — Send Cold Email",
+            "node": "SMTP — Send Cold Email",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Gmail — Send Cold Email": {
+    "SMTP — Send Cold Email": {
       "main": [
         [
           {
