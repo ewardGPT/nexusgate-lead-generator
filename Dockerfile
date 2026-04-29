@@ -7,4 +7,4 @@ RUN mkdir -p /app/output /root/.cache/puppeteer/chrome/linux-127.0.6533.88/chrom
 COPY apps/worker/package.json apps/worker/tsconfig.json apps/worker/tsconfig.base.json ./
 COPY apps/worker/src ./src
 RUN pnpm install --no-frozen-lockfile --filter=worker && pnpm build
-CMD ["node", "dist/index.js"]
+CMD ["node", "apps/worker/dist/index.js"]
